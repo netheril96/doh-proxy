@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -16,13 +18,21 @@ import (
 )
 
 const (
-	googleDNS          = "8.8.8.8:53"
+	googleDoHUpstream  = "https://dns.google/dns-query"
 	ipv4SubnetMask     = 24
 	ipv6SubnetMask     = 56
 	shutdownTimeout    = 5 * time.Second
 	dohMimeType        = "application/dns-message"
 	forwardedForHeader = "X-Forwarded-For"
+	upstreamTimeout    = 4 * time.Second
 )
+
+// httpClient is a reusable HTTP client for forwarding DoH queries.
+// It's configured with a timeout and is safe for concurrent use.
+var httpClient = &http.Client{
+	// Using a timeout shorter than the server's shutdown timeout.
+	Timeout: upstreamTimeout,
+}
 
 func main() {
 	socketPath := flag.String("socket", "/tmp/doh-proxy.sock", "Path to the Unix domain socket")
@@ -156,17 +166,39 @@ func dnsQueryHandler(w http.ResponseWriter, r *http.Request) {
 	ecs.SourceScope = 0
 	opt.Option = append(opt.Option, ecs)
 
-	// Forward the query to the upstream DNS server
-	dnsClient := new(dns.Client)
-	respMsg, _, err := dnsClient.Exchange(msg, googleDNS)
+	// Pack the modified DNS query to be sent upstream.
+	packedQuery, err := msg.Pack()
 	if err != nil {
-		log.Printf("DNS exchange with %s failed: %v", googleDNS, err)
-		http.Error(w, "DNS query failed", http.StatusServiceUnavailable)
+		http.Error(w, "Failed to pack DNS query for upstream", http.StatusInternalServerError)
 		return
 	}
 
-	// Pack the DNS response to send back to the client
-	respBody, err := respMsg.Pack()
+	// Forward the query to the upstream DoH server.
+	// We use the original request's context to handle cancellation.
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, googleDoHUpstream, bytes.NewReader(packedQuery))
+	if err != nil {
+		log.Printf("Failed to create upstream request: %v", err)
+		http.Error(w, "Failed to create upstream request", http.StatusInternalServerError)
+		return
+	}
+	upstreamReq.Header.Set("Content-Type", dohMimeType)
+	upstreamReq.Header.Set("Accept", dohMimeType)
+
+	upstreamResp, err := httpClient.Do(upstreamReq)
+	if err != nil {
+		log.Printf("Upstream DoH query to %s failed: %v", googleDoHUpstream, err)
+		http.Error(w, "DNS query failed", http.StatusServiceUnavailable)
+		return
+	}
+	defer upstreamResp.Body.Close()
+
+	if upstreamResp.StatusCode != http.StatusOK {
+		log.Printf("Upstream DoH server returned status: %s", upstreamResp.Status)
+		http.Error(w, fmt.Sprintf("Upstream error: %s", upstreamResp.Status), http.StatusBadGateway)
+		return
+	}
+
+	respBody, err := io.ReadAll(upstreamResp.Body)
 	if err != nil {
 		http.Error(w, "Failed to pack DNS response", http.StatusInternalServerError)
 		return
