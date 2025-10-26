@@ -124,19 +124,29 @@ func dnsQueryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Truncate the client IP for privacy, as requested.
+	var truncatedIP net.IP
+	if clientIP.To4() != nil {
+		mask := net.CIDRMask(ipv4SubnetMask, 32)
+		truncatedIP = clientIP.Mask(mask)
+	} else {
+		mask := net.CIDRMask(ipv6SubnetMask, 128)
+		truncatedIP = clientIP.Mask(mask)
+	}
+
 	// Create and attach EDNS0 subnet option
 	opt := msg.IsEdns0()
 	if opt == nil {
 		opt = new(dns.OPT)
 		opt.Hdr.Name = "."
 		opt.Hdr.Rrtype = dns.TypeOPT
-		msg.Extra = append(msg.Extra, opt)
+		msg.Extra = append([]dns.RR{opt}, msg.Extra...)
 	}
 
 	ecs := new(dns.EDNS0_SUBNET)
 	ecs.Code = dns.EDNS0SUBNET
-	ecs.Address = clientIP
-	if clientIP.To4() != nil {
+	ecs.Address = truncatedIP
+	if truncatedIP.To4() != nil {
 		ecs.Family = 1 // IPv4
 		ecs.SourceNetmask = ipv4SubnetMask
 	} else {
@@ -155,7 +165,7 @@ func dnsQueryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pack the response message
+	// Pack the DNS response to send back to the client
 	respBody, err := respMsg.Pack()
 	if err != nil {
 		http.Error(w, "Failed to pack DNS response", http.StatusInternalServerError)
